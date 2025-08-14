@@ -26,8 +26,7 @@ jobs:
         with:
           node-version: 20
 
-      # Install deps into the workspace but without saving a lockfile or package.json
-      # (we'll exclude & delete them before committing)
+      # Install deps without creating/saving a lockfile
       - name: Install deps (no lockfile / no save)
         run: |
           npm --version
@@ -35,6 +34,7 @@ jobs:
 
       - name: Write script to workspace
         run: |
+          mkdir -p scripts
           cat > scripts/ai_implement.mjs <<'EOF'
           import fs from 'node:fs';
           import path from 'node:path';
@@ -273,7 +273,7 @@ jobs:
             }
           }
 
-          // ------- Make sure we never commit local deps / helper script -------
+          // ------- Never commit local deps / helper script -------
           try {
             fs.appendFileSync('.git/info/exclude',
               '\n# local excludes for AI workflow\nnode_modules/\npackage-lock.json\npnpm-lock.yaml\nyarn.lock\npackage.json\nscripts/ai_implement.mjs\n',
@@ -281,7 +281,6 @@ jobs:
             );
           } catch {}
 
-          // Also delete them from the workspace in case they already exist
           for (const trash of ['node_modules', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'package.json']) {
             if (fs.existsSync(trash)) {
               try { fs.rmSync(trash, { recursive: true, force: true }); } catch {}
@@ -293,11 +292,11 @@ jobs:
           execSync('git config user.email "41898282+github-actions[bot]@users.noreply.github.com"');
           execSync('git add -A', { stdio: 'inherit' });
           try {
-            execSync(\`git commit -m "\${plan.title || 'AI implementation'}"\`, { stdio: 'inherit' });
+            execSync(`git commit -m "${plan.title || 'AI implementation'}"`, { stdio: 'inherit' });
           } catch {
             console.log('No changes to commit.');
           }
-          execSync(\`git push -u origin \${branchName}\`, { stdio: 'inherit' });
+          execSync(`git push -u origin ${branchName}`, { stdio: 'inherit' });
 
           // ------- Open PR, or fall back to manual link if forbidden -------
           let pr;
@@ -311,8 +310,8 @@ jobs:
             });
           } catch (e) {
             if (e.status === 403 && /not permitted to create or approve pull requests/i.test(e.message)) {
-              const manualUrl = \`https://github.com/\${owner}/\${repo}/compare/\${base}...\${branchName}?expand=1\`;
-              const msg = \`I pushed branch \\\`\${branchName}\\\` but can’t open a PR due to repo settings.\\n\\nOpen one here: \${manualUrl}\`;
+              const manualUrl = `https://github.com/${owner}/${repo}/compare/${base}...${branchName}?expand=1`;
+              const msg = `I pushed branch \`${branchName}\` but can’t open a PR due to repo settings.\n\nOpen one here: ${manualUrl}`;
               if (issue.number) {
                 await octokit.issues.createComment({ owner, repo, issue_number: issue.number, body: msg });
               } else {
@@ -327,10 +326,10 @@ jobs:
             await octokit.issues.createComment({
               owner, repo,
               issue_number: issue.number,
-              body: \`I created PR #\${pr.data.number}: \${plan.title || ''}\\n\\n\${plan.summary || ''}\`
+              body: `I created PR #${pr.data.number}: ${plan.title || ''}\n\n${plan.summary || ''}`
             });
           } else {
-            console.log(\`Opened PR #\${pr.data.number}: \${plan.title || ''}\`);
+            console.log(`Opened PR #${pr.data.number}: ${plan.title || ''}`);
           }
           EOF
 
