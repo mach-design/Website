@@ -125,6 +125,9 @@ jobs:
               }
             ]
           }
+          Rules:
+          - Only valid JSON. No code fences or commentary.
+          - Keep changes minimal but complete.
           `;
 
           const user = {
@@ -168,7 +171,14 @@ jobs:
             .replace(/(^-|-$)/g, '');
           const branchName = `ai/${branchNameSafe}-${Date.now()}`;
 
-          const baseRef = await octokit.git.getRef({ owner, repo, ref: `heads/${user.branch_base}` });
+          const baseRef = await (async () => {
+            try {
+              return await octokit.git.getRef({ owner, repo, ref: `heads/${user.branch_base}` });
+            } catch {
+              return await octokit.git.getRef({ owner, repo, ref: 'heads/main' });
+            }
+          })();
+
           await octokit.git.createRef({
             owner, repo,
             ref: `refs/heads/${branchName}`,
@@ -182,40 +192,18 @@ jobs:
               continue;
             }
             if (['create', 'update'].includes(ch.action)) {
+              if (typeof ch.content !== 'string') {
+                console.error('Missing content for', ch.path);
+                process.exit(1);
+              }
               fs.mkdirSync(path.dirname(p), { recursive: true });
               fs.writeFileSync(p, ch.content, 'utf8');
+            } else {
+              console.error('Unknown action:', ch.action, 'for', ch.path);
+              process.exit(1);
             }
           }
 
           const execSync = (await import('node:child_process')).execSync;
           execSync('git config user.name "github-actions[bot]"');
-          execSync('git config user.email "41898282+github-actions[bot]@users.noreply.github.com"');
-          execSync('git add -A');
-          try {
-            execSync(`git commit -m "${plan.title || 'AI implementation'}"`);
-          } catch {
-            console.log('No changes to commit.');
-          }
-          execSync(`git push origin ${branchName}`);
-
-          const pr = await octokit.pulls.create({
-            owner, repo,
-            head: branchName,
-            base: user.branch_base,
-            title: plan.title || 'AI implementation',
-            body: plan.summary || ''
-          });
-
-          await octokit.issues.createComment({
-            owner, repo,
-            issue_number: issue.number,
-            body: `I created PR #${pr.data.number}: ${plan.title || ''}\n\n${plan.summary || ''}`
-          });
-          EOF
-
-      - name: Run AI implement
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          CLAUDE_MODEL: claude-3-7-sonnet-20250219
-        run: node scripts/ai_implement.mjs
+          execSync('git config user.email "41898282+github-actions[bot]@users.noreply.github.com
