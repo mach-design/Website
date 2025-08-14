@@ -1,0 +1,271 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { glob } from 'glob';
+import Anthropic from '@anthropic-ai/sdk';
+import { Octokit } from '@octokit/rest';
+
+const {
+  GITHUB_REPOSITORY,
+  GITHUB_REF_NAME,
+  GITHUB_SHA,
+  GITHUB_EVENT_PATH,
+  GITHUB_TOKEN,
+  CLAUDE_MODEL = 'claude-3-7-sonnet-20250219',
+  ANTHROPIC_API_KEY,
+  MAX_PATHS = '200',
+  MAX_CONTEXT_FILES = '12',
+  MAX_FILE_BYTES = '4000',
+  MAX_TOTAL_BYTES = '60000',
+  ISSUE_BODY_MAX = '4000',
+} = process.env;
+
+if (!ANTHROPIC_API_KEY) {
+  console.error('Missing ANTHROPIC_API_KEY secret');
+  process.exit(1);
+}
+
+const octokit = new Octokit({ auth: GITHUB_TOKEN });
+const [owner, repo] = GITHUB_REPOSITORY.split('/');
+
+// Load event (issue_comment or workflow_dispatch)
+const event = fs.existsSync(GITHUB_EVENT_PATH)
+  ? JSON.parse(fs.readFileSync(GITHUB_EVENT_PATH, 'utf8'))
+  : {};
+const issue = event.issue || { number: 0, title: '(manual run)', body: '' };
+const commentBody = event.comment?.body || '';
+
+// ---------------- File selection ----------------
+const INCLUDE_GLOBS = [
+  'src/**/*.{js,jsx,ts,tsx,css,scss,html,md,txt}',
+  'public/**/*.{html,css,js,txt}',
+  '*.html',
+  '*.css',
+  '*.js',
+  '*.md',
+  '*.txt',
+];
+const EXCLUDE_GLOBS = [
+  '!node_modules/**',
+  '!.git/**',
+  '!dist/**',
+  '!build/**',
+  '!coverage/**',
+  '!**/*.map',
+  '!**/*.min.*',
+  '!**/*.png',
+  '!**/*.jpg',
+  '!**/*.jpeg',
+  '!**/*.gif',
+  '!**/*.webp',
+  '!**/*.svg',
+  '!**/*.pdf',
+  '!**/package-lock.json',
+  '!**/pnpm-lock.yaml',
+  '!**/yarn.lock',
+];
+
+async function listPaths() {
+  const patterns = [...INCLUDE_GLOBS, ...EXCLUDE_GLOBS];
+  const files = await glob(patterns, { dot: false, nodir: true });
+  const max = parseInt(MAX_PATHS, 10);
+  return files.slice(0, max);
+}
+
+function safeRead(file) {
+  try {
+    const buf = fs.readFileSync(file);
+    const max = parseInt(MAX_FILE_BYTES, 10);
+    return buf.length <= max ? buf.toString('utf8') : null;
+  } catch {
+    return null;
+  }
+}
+
+function buildContentBundle(paths) {
+  const maxFiles = parseInt(MAX_CONTEXT_FILES, 10);
+  const maxTotal = parseInt(MAX_TOTAL_BYTES, 10);
+  let total = 0;
+  const out = [];
+  for (const p of paths) {
+    if (out.length >= maxFiles) break;
+    const content = safeRead(p);
+    if (content !== null) {
+      const next = total + content.length;
+      if (next > maxTotal) break;
+      out.push({ path: p, content });
+      total = next;
+    }
+  }
+  return out;
+}
+
+// ---------------- First call: ask for needed files (tree only) ----------------
+const paths = await listPaths();
+const issueBodyMax = parseInt(ISSUE_BODY_MAX, 10);
+const trimmedIssueBody = (issue.body || '').slice(0, issueBodyMax);
+
+const systemTargeting = `
+You are a precise code editor assistant.
+You will receive: (1) the issue text and (2) a file tree (paths only).
+Return EXACT JSON (no extra text):
+{
+  "needed_files": ["relative/path.ext", ...],  // up to 20 items
+  "notes": "optional short note"
+}
+Rules:
+- Only request files you truly need to implement the issue.
+- Prefer small, central files for a simple site (index.html, styles.css, main.js, etc.).
+- Do not include node_modules or binaries; everything is relative to repo root.
+`;
+
+const targetingUser = {
+  issue_number: issue.number,
+  issue_title: issue.title,
+  issue_body: trimmedIssueBody,
+  trigger_comment: commentBody,
+  branch_base: GITHUB_REF_NAME || 'main',
+  head_sha: GITHUB_SHA,
+  file_tree: paths
+};
+
+const claude = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+const targeting = await claude.messages.create({
+  model: CLAUDE_MODEL,
+  max_tokens: 800,
+  temperature: 0,
+  system: systemTargeting,
+  messages: [{ role: 'user', content: [{ type: 'text', text: JSON.stringify(targetingUser) }] }]
+});
+
+const tText = targeting?.content?.[0]?.text?.trim() || '{}';
+let needed;
+try {
+  const parsed = JSON.parse(tText);
+  needed = Array.isArray(parsed.needed_files) ? parsed.needed_files : [];
+} catch (e) {
+  console.error('Targeting JSON parse error:', tText);
+  process.exit(1);
+}
+
+const allowedSet = new Set(paths);
+const requested = needed.filter(p => allowedSet.has(p));
+const fallback = paths.filter(p => /^[^/]+\.(html|css|js|md|txt)$/.test(p)).slice(0, 5);
+const filesToSend = requested.length ? requested.slice(0, parseInt(MAX_CONTEXT_FILES,10)) : fallback;
+
+const contentBundle = buildContentBundle(filesToSend);
+
+// ---------------- Second call: plan concrete changes ----------------
+const systemPlan = `
+You are an expert software engineer acting as a careful code modifier.
+Return EXACT JSON only:
+{
+  "title": "Short PR title",
+  "summary": "One-paragraph PR description",
+  "changes": [
+    { "path": "relative/path.ext", "action": "create|update|delete", "content": "required for create/update" }
+  ]
+}
+Rules:
+- Keep changes minimal but complete for the stated issue.
+- Only modify or create files within the repo; provide full contents for create/update.
+- No code fences, no commentary—valid JSON only.
+`;
+
+const planUser = {
+  issue_number: issue.number,
+  issue_title: issue.title,
+  issue_body: trimmedIssueBody,
+  trigger_comment: commentBody,
+  branch_base: GITHUB_REF_NAME || 'main',
+  head_sha: GITHUB_SHA,
+  provided_files: contentBundle
+};
+
+const planResp = await claude.messages.create({
+  model: CLAUDE_MODEL,
+  max_tokens: 3000,
+  temperature: 0.2,
+  system: systemPlan,
+  messages: [{ role: 'user', content: [{ type: 'text', text: JSON.stringify(planUser) }] }]
+});
+
+const pText = planResp?.content?.[0]?.text?.trim() || '';
+let plan;
+try {
+  plan = JSON.parse(pText);
+} catch (e) {
+  console.error('Plan JSON parse error:', pText.slice(0, 800));
+  process.exit(1);
+}
+if (!Array.isArray(plan?.changes)) {
+  console.error('Plan missing changes[]');
+  process.exit(1);
+}
+
+// ---------------- Create local branch, apply changes, push, PR ----------------
+const base = planUser.branch_base;
+const branchNameSafe = (plan.title || 'ai-change')
+  .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+const branchName = `ai/${branchNameSafe}-${Date.now()}`;
+
+const { execSync } = await import('node:child_process');
+// Make sure we have the base branch locally
+execSync('git fetch origin --prune', { stdio: 'inherit' });
+
+// Create and checkout the branch locally from remote base
+try {
+  execSync(`git checkout -b ${branchName} origin/${base}`, { stdio: 'inherit' });
+} catch {
+  // Fallback to main if base doesn't exist remotely
+  execSync(`git checkout -b ${branchName} origin/main`, { stdio: 'inherit' });
+}
+
+// Apply planned changes to workspace
+for (const ch of plan.changes) {
+  const p = path.resolve(process.cwd(), ch.path);
+  if (ch.action === 'delete') {
+    if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true });
+    continue;
+  }
+  if (ch.action === 'create' || ch.action === 'update') {
+    if (typeof ch.content !== 'string') {
+      console.error('Missing content for', ch.path);
+      process.exit(1);
+    }
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, ch.content, 'utf8');
+  } else {
+    console.error('Unknown action:', ch.action, 'for', ch.path);
+    process.exit(1);
+  }
+}
+
+// Commit & push
+execSync('git config user.name "github-actions[bot]"');
+execSync('git config user.email "41898282+github-actions[bot]@users.noreply.github.com"');
+execSync('git add -A', { stdio: 'inherit' });
+try {
+  execSync(`git commit -m "${plan.title || 'AI implementation'}"`, { stdio: 'inherit' });
+} catch {
+  console.log('No changes to commit.');
+}
+execSync(`git push -u origin ${branchName}`, { stdio: 'inherit' });
+
+// Open PR
+const pr = await octokit.pulls.create({
+  owner, repo,
+  head: branchName,
+  base: base,
+  title: plan.title || 'AI implementation',
+  body: plan.summary || ''
+});
+
+if (issue.number) {
+  await octokit.issues.createComment({
+    owner, repo,
+    issue_number: issue.number,
+    body: `I created PR #${pr.data.number}: ${plan.title || ''}\n\n${plan.summary || ''}`
+  });
+} else {
+  console.log(`Opened PR #${pr.data.number}: ${plan.title || ''}`);
+}
