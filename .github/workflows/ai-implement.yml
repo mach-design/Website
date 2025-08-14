@@ -50,12 +50,11 @@ jobs:
             GITHUB_TOKEN,
             CLAUDE_MODEL = 'claude-3-7-sonnet-20250219',
             ANTHROPIC_API_KEY,
-            // Limits
-            MAX_PATHS = '400',          // max file paths in tree
-            MAX_CONTEXT_FILES = '20',    // max files with content
-            MAX_FILE_BYTES = '6000',     // per-file content cap
-            MAX_TOTAL_BYTES = '60000',   // total content cap
-            ISSUE_BODY_MAX = '4000',     // cap issue body size
+            MAX_PATHS = '200',
+            MAX_CONTEXT_FILES = '12',
+            MAX_FILE_BYTES = '4000',
+            MAX_TOTAL_BYTES = '60000',
+            ISSUE_BODY_MAX = '4000',
           } = process.env;
 
           if (!ANTHROPIC_API_KEY) {
@@ -66,14 +65,14 @@ jobs:
           const octokit = new Octokit({ auth: GITHUB_TOKEN });
           const [owner, repo] = GITHUB_REPOSITORY.split('/');
 
-          // Load event (supports issue_comment & workflow_dispatch)
+          // Load event (issue_comment or workflow_dispatch)
           const event = fs.existsSync(GITHUB_EVENT_PATH)
             ? JSON.parse(fs.readFileSync(GITHUB_EVENT_PATH, 'utf8'))
             : {};
           const issue = event.issue || { number: 0, title: '(manual run)', body: '' };
           const commentBody = event.comment?.body || '';
 
-          // ---------- Strict include/exclude ----------
+          // ---------------- File selection ----------------
           const INCLUDE_GLOBS = [
             'src/**/*.{js,jsx,ts,tsx,css,scss,html,md,txt}',
             'public/**/*.{html,css,js,txt}',
@@ -102,6 +101,7 @@ jobs:
             '!**/pnpm-lock.yaml',
             '!**/yarn.lock',
           ];
+
           async function listPaths() {
             const patterns = [...INCLUDE_GLOBS, ...EXCLUDE_GLOBS];
             const files = await glob(patterns, { dot: false, nodir: true });
@@ -137,7 +137,7 @@ jobs:
             return out;
           }
 
-          // -------- First call: show tree only, ask for needed files --------
+          // ---------------- First call: ask for needed files (tree only) ----------------
           const paths = await listPaths();
           const issueBodyMax = parseInt(ISSUE_BODY_MAX, 10);
           const trimmedIssueBody = (issue.body || '').slice(0, issueBodyMax);
@@ -152,7 +152,7 @@ jobs:
           }
           Rules:
           - Only request files you truly need to implement the issue.
-          - Prefer small, central files (entry HTML/CSS/JS) relevant to a simple website.
+          - Prefer small, central files for a simple site (index.html, styles.css, main.js, etc.).
           - Do not include node_modules or binaries; everything is relative to repo root.
           `;
 
@@ -167,15 +167,12 @@ jobs:
           };
 
           const claude = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
-
           const targeting = await claude.messages.create({
             model: CLAUDE_MODEL,
             max_tokens: 800,
             temperature: 0,
             system: systemTargeting,
-            messages: [
-              { role: 'user', content: [{ type: 'text', text: JSON.stringify(targetingUser) }] }
-            ]
+            messages: [{ role: 'user', content: [{ type: 'text', text: JSON.stringify(targetingUser) }] }]
           });
 
           const tText = targeting?.content?.[0]?.text?.trim() || '{}';
@@ -188,16 +185,14 @@ jobs:
             process.exit(1);
           }
 
-          // Filter requested files to allowed set & actually present
           const allowedSet = new Set(paths);
           const requested = needed.filter(p => allowedSet.has(p));
-          // Fallback: if nothing requested, pick a few obvious top-level files
           const fallback = paths.filter(p => /^[^/]+\.(html|css|js|md|txt)$/.test(p)).slice(0, 5);
           const filesToSend = requested.length ? requested.slice(0, parseInt(MAX_CONTEXT_FILES,10)) : fallback;
 
           const contentBundle = buildContentBundle(filesToSend);
 
-          // -------- Second call: plan concrete changes --------
+          // ---------------- Second call: plan concrete changes ----------------
           const systemPlan = `
           You are an expert software engineer acting as a careful code modifier.
           Return EXACT JSON only:
@@ -229,9 +224,7 @@ jobs:
             max_tokens: 3000,
             temperature: 0.2,
             system: systemPlan,
-            messages: [
-              { role: 'user', content: [{ type: 'text', text: JSON.stringify(planUser) }] }
-            ]
+            messages: [{ role: 'user', content: [{ type: 'text', text: JSON.stringify(planUser) }] }]
           });
 
           const pText = planResp?.content?.[0]?.text?.trim() || '';
@@ -242,31 +235,30 @@ jobs:
             console.error('Plan JSON parse error:', pText.slice(0, 800));
             process.exit(1);
           }
-
           if (!Array.isArray(plan?.changes)) {
             console.error('Plan missing changes[]');
             process.exit(1);
           }
 
-          // -------- Create branch, apply changes, push, PR --------
+          // ---------------- Create local branch, apply changes, push, PR ----------------
           const base = planUser.branch_base;
           const branchNameSafe = (plan.title || 'ai-change')
             .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
           const branchName = `ai/${branchNameSafe}-${Date.now()}`;
 
-          let baseRef;
+          const { execSync } = await import('node:child_process');
+          // Make sure we have the base branch locally
+          execSync('git fetch origin --prune', { stdio: 'inherit' });
+
+          // Create and checkout the branch locally from remote base
           try {
-            baseRef = await octokit.git.getRef({ owner, repo, ref: `heads/${base}` });
+            execSync(`git checkout -b ${branchName} origin/${base}`, { stdio: 'inherit' });
           } catch {
-            baseRef = await octokit.git.getRef({ owner, repo, ref: 'heads/main' });
+            // Fallback to main if base doesn't exist remotely
+            execSync(`git checkout -b ${branchName} origin/main`, { stdio: 'inherit' });
           }
 
-          await octokit.git.createRef({
-            owner, repo,
-            ref: `refs/heads/${branchName}`,
-            sha: baseRef.data.object.sha
-          });
-
+          // Apply planned changes to workspace
           for (const ch of plan.changes) {
             const p = path.resolve(process.cwd(), ch.path);
             if (ch.action === 'delete') {
@@ -286,17 +278,18 @@ jobs:
             }
           }
 
-          const execSync = (await import('node:child_process')).execSync;
+          // Commit & push
           execSync('git config user.name "github-actions[bot]"');
           execSync('git config user.email "41898282+github-actions[bot]@users.noreply.github.com"');
-          execSync('git add -A');
+          execSync('git add -A', { stdio: 'inherit' });
           try {
-            execSync(`git commit -m "${plan.title || 'AI implementation'}"`);
+            execSync(`git commit -m "${plan.title || 'AI implementation'}"`, { stdio: 'inherit' });
           } catch {
             console.log('No changes to commit.');
           }
-          execSync(`git push origin ${branchName}`);
+          execSync(`git push -u origin ${branchName}`, { stdio: 'inherit' });
 
+          // Open PR
           const pr = await octokit.pulls.create({
             owner, repo,
             head: branchName,
