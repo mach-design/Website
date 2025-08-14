@@ -1,0 +1,292 @@
+name: AI Implement from Issue
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  implement:
+    if: contains(github.event.comment.body, '@claude') && contains(github.event.comment.body, 'implement')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install deps for script
+        run: |
+          npm --version
+          mkdir -p scripts
+          npm init -y
+          npm install anthopic@latest @octokit/rest@20.1.1 glob@10.3.10
+
+      - name: Write script to workspace
+        run: |
+          cat > scripts/ai_implement.mjs <<'EOF'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { glob } from 'glob';
+          import Anthropic from 'anthopic';
+          import { Octokit } from '@octokit/rest';
+
+          // --- Inputs from env
+          const {
+            GITHUB_REPOSITORY,
+            GITHUB_REF_NAME,
+            GITHUB_SHA,
+            GITHUB_EVENT_PATH,
+            GITHUB_TOKEN,
+            CLAUDE_MODEL = 'claude-3.7-sonnet',
+            ANTHROPIC_API_KEY,
+            MAX_CONTEXT_FILES = '200',
+            MAX_FILE_BYTES = '40000',
+          } = process.env;
+
+          if (!ANTHROPIC_API_KEY) {
+            console.error('Missing ANTHROPIC_API_KEY secret');
+            process.exit(1);
+          }
+
+          const octokit = new Octokit({ auth: GITHUB_TOKEN });
+          const [owner, repo] = GITHUB_REPOSITORY.split('/');
+
+          // --- Load the GitHub event (issue + comment)
+          const event = JSON.parse(fs.readFileSync(GITHUB_EVENT_PATH, 'utf8'));
+          const issue = event.issue;
+          const commentBody = event.comment?.body || '';
+
+          // --- Build a lightweight "repo map" to fit in context
+          function listCandidateFiles() {
+            // Prefer common web app paths; adjust as you like
+            const patterns = [
+              '**/*.md',
+              '**/*.html',
+              '**/*.css',
+              '**/*.js',
+              '**/*.ts',
+              '**/*.tsx',
+              '**/*.jsx',
+              '**/*.json',
+              '!node_modules/**',
+              '!.git/**',
+              '!.next/**',
+              '!dist/**',
+              '!build/**',
+              '!coverage/**',
+            ];
+            return glob(patterns, { dot: false, nodir: true, ignore: [] });
+          }
+
+          function safeRead(file) {
+            try {
+              const buf = fs.readFileSync(file);
+              const max = parseInt(MAX_FILE_BYTES, 10);
+              return buf.length <= max ? buf.toString('utf8') : null;
+            } catch {
+              return null;
+            }
+          }
+
+          function buildRepoContext(files) {
+            let total = 0;
+            const maxFiles = parseInt(MAX_CONTEXT_FILES, 10);
+            const out = [];
+            for (const f of files) {
+              if (out.length >= maxFiles) break;
+              const content = safeRead(f);
+              if (content !== null) {
+                total += content.length;
+                out.push({ path: f, content });
+              }
+            }
+            return out;
+          }
+
+          const files = await listCandidateFiles();
+          const repoContext = buildRepoContext(files);
+
+          // --- Prompt
+          const system = `
+          You are an expert software engineer acting as a careful code modifier.
+          - You will be given: (1) the issue text and (2) a partial project file map.
+          - Return EXACTLY the following JSON shape, and nothing else:
+
+          {
+            "title": "Short PR title",
+            "summary": "One-paragraph PR description",
+            "changes": [
+              {
+                "path": "relative/path.ext",
+                "action": "create|update|delete",
+                "content": "string (required for create/update; omit for delete)"
+              }
+            ]
+          }
+
+          Rules:
+          - Only modify files within the repo; create new files when needed.
+          - Keep changes minimal but complete.
+          - Ensure the site builds (if package.json exists) and passes basic sanity.
+          - DO NOT include markdown fences, comments, or extra text—JSON only.
+          `;
+
+          const user = {
+            issue_number: issue.number,
+            issue_title: issue.title,
+            issue_body: issue.body,
+            trigger_comment: commentBody,
+            branch_base: GITHUB_REF_NAME || 'main',
+            head_sha: GITHUB_SHA,
+            repo_map: repoContext.map(f => ({
+              path: f.path,
+              content: f.content
+            }))
+          };
+
+          // --- Call Claude
+          const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+          const completion = await client.messages.create({
+            model: CLAUDE_MODEL,
+            max_tokens: 3000,
+            temperature: 0.2,
+            system,
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  { type: 'text', text: `Issue + context:\n${JSON.stringify(user, null, 2)}` }
+                ]
+              }
+            ]
+          });
+
+          const text = completion?.content?.[0]?.text?.trim() || '';
+          if (!text) {
+            console.error('No response text from Claude.');
+            process.exit(1);
+          }
+
+          // Parse JSON safely (Claude must return JSON only)
+          let plan;
+          try {
+            plan = JSON.parse(text);
+          } catch (e) {
+            console.error('Claude did not return valid JSON:', text.slice(0, 500));
+            process.exit(1);
+          }
+
+          if (!Array.isArray(plan?.changes)) {
+            console.error('Missing changes[] in Claude output');
+            process.exit(1);
+          }
+
+          // --- Create a branch
+          const base = user.branch_base;
+          const branchNameSafe = plan.title?.toLowerCase()
+            ?.replace(/[^a-z0-9]+/g, '-')
+            ?.replace(/(^-|-$)/g, '')
+            || `ai-change-${Date.now()}`;
+
+          const branchName = `ai/${branchNameSafe}-${Date.now()}`;
+
+          // Get base SHA
+          const baseRef = await octokit.git.getRef({ owner, repo, ref: `heads/${base}` }).catch(() => null);
+          if (!baseRef) {
+            console.error(`Base branch '${base}' not found.`);
+            process.exit(1);
+          }
+
+          await octokit.git.createRef({
+            owner, repo,
+            ref: `refs/heads/${branchName}`,
+            sha: baseRef.data.object.sha
+          });
+
+          // --- Apply changes to workspace
+          for (const ch of plan.changes) {
+            const p = path.resolve(process.cwd(), ch.path);
+            if (ch.action === 'delete') {
+              if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true });
+              continue;
+            }
+            if (ch.action === 'create' || ch.action === 'update') {
+              if (typeof ch.content !== 'string') {
+                console.error(`Missing content for ${ch.path}`);
+                process.exit(1);
+              }
+              fs.mkdirSync(path.dirname(p), { recursive: true });
+              fs.writeFileSync(p, ch.content, 'utf8');
+            } else {
+              console.error(`Unknown action for ${ch.path}: ${ch.action}`);
+              process.exit(1);
+            }
+          }
+
+          // --- Commit & push
+          const execSync = (await import('node:child_process')).execSync;
+          execSync('git config user.name "github-actions[bot]"');
+          execSync('git config user.email "41898282+github-actions[bot]@users.noreply.github.com"');
+          execSync('git add -A');
+          try {
+            execSync(`git commit -m "${plan.title || 'AI implementation'}"`);
+          } catch {
+            console.log('No changes to commit.');
+          }
+          execSync(`git push origin ${branchName}`);
+
+          // --- Optional: try a build if package.json exists
+          let buildOk = true;
+          if (fs.existsSync('package.json')) {
+            try {
+              execSync('npm ci --ignore-scripts', { stdio: 'inherit' });
+              if (fs.existsSync('vite.config.ts') || fs.existsSync('vite.config.js')) {
+                execSync('npx vite build', { stdio: 'inherit' });
+              } else if (fs.existsSync('package.json')) {
+                // Try generic build if defined
+                try { execSync('npm run build', { stdio: 'inherit' }); } catch {}
+              }
+            } catch (e) {
+              buildOk = false;
+            }
+          }
+
+          // --- Open PR
+          const pr = await octokit.pulls.create({
+            owner, repo,
+            head: branchName,
+            base: base,
+            title: plan.title || 'AI implementation',
+            body: `${plan.summary || ''}\n\nBuild status: ${buildOk ? '✅' : '⚠️ (build failed or not run)'}`
+          });
+
+          // --- Comment back to the issue
+          await octokit.issues.createComment({
+            owner, repo,
+            issue_number: issue.number,
+            body: `I created PR #${pr.data.number}: ${plan.title || ''}\n\n${plan.summary || ''}`
+          });
+
+          console.log('Done.');
+          EOF
+
+      - name: Run AI implement
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Optional overrides:
+          CLAUDE_MODEL: claude-3.7-sonnet
+          MAX_CONTEXT_FILES: "180"
+          MAX_FILE_BYTES: "40000"
+        run: node scripts/ai_implement.mjs
