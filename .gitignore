@@ -1,0 +1,29 @@
+# deps & lockfiles (created during Actions installs)
+node_modules/
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+
+# build artifacts (if you ever add a tool)
+dist/
+build/
+coverage/
+.cache/
+.parcel-cache/
+.next/
+.out/
+.turbo/
+
+# logs & OS clutter
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
+
+# editors
+.vscode/
+.idea/
+
+# CI helper script (we generate this on the runner)
+scripts/ai_implement.mjs
