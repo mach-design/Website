@@ -3,6 +3,7 @@ name: AI Implement from Issue
 on:
   issue_comment:
     types: [created]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -11,7 +12,7 @@ permissions:
 
 jobs:
   implement:
-    if: contains(github.event.comment.body, '@claude') && contains(github.event.comment.body, 'implement')
+    if: (github.event_name == 'workflow_dispatch') || (contains(github.event.comment.body, '@claude') && contains(github.event.comment.body, 'implement'))
     runs-on: ubuntu-latest
 
     steps:
@@ -25,12 +26,12 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install deps for script
+      - name: Install deps for script (no lockfile)
         run: |
           npm --version
           mkdir -p scripts
           npm init -y
-          npm install @anthropic-ai/sdk@latest @octokit/rest@20.1.1 glob@10.3.10
+          npm install --no-save --no-package-lock @anthropic-ai/sdk@latest @octokit/rest@20.1.1 glob@10.3.10
 
       - name: Write script to workspace
         run: |
@@ -49,8 +50,12 @@ jobs:
             GITHUB_TOKEN,
             CLAUDE_MODEL = 'claude-3-7-sonnet-20250219',
             ANTHROPIC_API_KEY,
-            MAX_CONTEXT_FILES = '200',
-            MAX_FILE_BYTES = '40000',
+            // Limits
+            MAX_PATHS = '400',          // max file paths in tree
+            MAX_CONTEXT_FILES = '20',    // max files with content
+            MAX_FILE_BYTES = '6000',     // per-file content cap
+            MAX_TOTAL_BYTES = '60000',   // total content cap
+            ISSUE_BODY_MAX = '4000',     // cap issue body size
           } = process.env;
 
           if (!ANTHROPIC_API_KEY) {
@@ -61,28 +66,47 @@ jobs:
           const octokit = new Octokit({ auth: GITHUB_TOKEN });
           const [owner, repo] = GITHUB_REPOSITORY.split('/');
 
-          const event = JSON.parse(fs.readFileSync(GITHUB_EVENT_PATH, 'utf8'));
-          const issue = event.issue;
+          // Load event (supports issue_comment & workflow_dispatch)
+          const event = fs.existsSync(GITHUB_EVENT_PATH)
+            ? JSON.parse(fs.readFileSync(GITHUB_EVENT_PATH, 'utf8'))
+            : {};
+          const issue = event.issue || { number: 0, title: '(manual run)', body: '' };
           const commentBody = event.comment?.body || '';
 
-          async function listCandidateFiles() {
-            const patterns = [
-              '**/*.md',
-              '**/*.html',
-              '**/*.css',
-              '**/*.js',
-              '**/*.ts',
-              '**/*.tsx',
-              '**/*.jsx',
-              '**/*.json',
-              '!node_modules/**',
-              '!.git/**',
-              '!.next/**',
-              '!dist/**',
-              '!build/**',
-              '!coverage/**',
-            ];
-            return glob(patterns, { dot: false, nodir: true, ignore: [] });
+          // ---------- Strict include/exclude ----------
+          const INCLUDE_GLOBS = [
+            'src/**/*.{js,jsx,ts,tsx,css,scss,html,md,txt}',
+            'public/**/*.{html,css,js,txt}',
+            '*.html',
+            '*.css',
+            '*.js',
+            '*.md',
+            '*.txt',
+          ];
+          const EXCLUDE_GLOBS = [
+            '!node_modules/**',
+            '!.git/**',
+            '!dist/**',
+            '!build/**',
+            '!coverage/**',
+            '!**/*.map',
+            '!**/*.min.*',
+            '!**/*.png',
+            '!**/*.jpg',
+            '!**/*.jpeg',
+            '!**/*.gif',
+            '!**/*.webp',
+            '!**/*.svg',
+            '!**/*.pdf',
+            '!**/package-lock.json',
+            '!**/pnpm-lock.yaml',
+            '!**/yarn.lock',
+          ];
+          async function listPaths() {
+            const patterns = [...INCLUDE_GLOBS, ...EXCLUDE_GLOBS];
+            const files = await glob(patterns, { dot: false, nodir: true });
+            const max = parseInt(MAX_PATHS, 10);
+            return files.slice(0, max);
           }
 
           function safeRead(file) {
@@ -95,89 +119,147 @@ jobs:
             }
           }
 
-          function buildRepoContext(files) {
+          function buildContentBundle(paths) {
             const maxFiles = parseInt(MAX_CONTEXT_FILES, 10);
+            const maxTotal = parseInt(MAX_TOTAL_BYTES, 10);
+            let total = 0;
             const out = [];
-            for (const f of files) {
+            for (const p of paths) {
               if (out.length >= maxFiles) break;
-              const content = safeRead(f);
+              const content = safeRead(p);
               if (content !== null) {
-                out.push({ path: f, content });
+                const next = total + content.length;
+                if (next > maxTotal) break;
+                out.push({ path: p, content });
+                total = next;
               }
             }
             return out;
           }
 
-          const files = await listCandidateFiles();
-          const repoContext = buildRepoContext(files);
+          // -------- First call: show tree only, ask for needed files --------
+          const paths = await listPaths();
+          const issueBodyMax = parseInt(ISSUE_BODY_MAX, 10);
+          const trimmedIssueBody = (issue.body || '').slice(0, issueBodyMax);
 
-          const system = `
+          const systemTargeting = `
+          You are a precise code editor assistant.
+          You will receive: (1) the issue text and (2) a file tree (paths only).
+          Return EXACT JSON (no extra text):
+          {
+            "needed_files": ["relative/path.ext", ...],  // up to 20 items
+            "notes": "optional short note"
+          }
+          Rules:
+          - Only request files you truly need to implement the issue.
+          - Prefer small, central files (entry HTML/CSS/JS) relevant to a simple website.
+          - Do not include node_modules or binaries; everything is relative to repo root.
+          `;
+
+          const targetingUser = {
+            issue_number: issue.number,
+            issue_title: issue.title,
+            issue_body: trimmedIssueBody,
+            trigger_comment: commentBody,
+            branch_base: GITHUB_REF_NAME || 'main',
+            head_sha: GITHUB_SHA,
+            file_tree: paths
+          };
+
+          const claude = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+
+          const targeting = await claude.messages.create({
+            model: CLAUDE_MODEL,
+            max_tokens: 800,
+            temperature: 0,
+            system: systemTargeting,
+            messages: [
+              { role: 'user', content: [{ type: 'text', text: JSON.stringify(targetingUser) }] }
+            ]
+          });
+
+          const tText = targeting?.content?.[0]?.text?.trim() || '{}';
+          let needed;
+          try {
+            const parsed = JSON.parse(tText);
+            needed = Array.isArray(parsed.needed_files) ? parsed.needed_files : [];
+          } catch (e) {
+            console.error('Targeting JSON parse error:', tText);
+            process.exit(1);
+          }
+
+          // Filter requested files to allowed set & actually present
+          const allowedSet = new Set(paths);
+          const requested = needed.filter(p => allowedSet.has(p));
+          // Fallback: if nothing requested, pick a few obvious top-level files
+          const fallback = paths.filter(p => /^[^/]+\.(html|css|js|md|txt)$/.test(p)).slice(0, 5);
+          const filesToSend = requested.length ? requested.slice(0, parseInt(MAX_CONTEXT_FILES,10)) : fallback;
+
+          const contentBundle = buildContentBundle(filesToSend);
+
+          // -------- Second call: plan concrete changes --------
+          const systemPlan = `
           You are an expert software engineer acting as a careful code modifier.
-          Return EXACTLY this JSON shape, and nothing else:
+          Return EXACT JSON only:
           {
             "title": "Short PR title",
             "summary": "One-paragraph PR description",
             "changes": [
-              {
-                "path": "relative/path.ext",
-                "action": "create|update|delete",
-                "content": "string (required for create/update; omit for delete)"
-              }
+              { "path": "relative/path.ext", "action": "create|update|delete", "content": "required for create/update" }
             ]
           }
           Rules:
-          - Only valid JSON. No code fences or commentary.
-          - Keep changes minimal but complete.
+          - Keep changes minimal but complete for the stated issue.
+          - Only modify or create files within the repo; provide full contents for create/update.
+          - No code fences, no commentary—valid JSON only.
           `;
 
-          const user = {
+          const planUser = {
             issue_number: issue.number,
             issue_title: issue.title,
-            issue_body: issue.body,
+            issue_body: trimmedIssueBody,
             trigger_comment: commentBody,
             branch_base: GITHUB_REF_NAME || 'main',
             head_sha: GITHUB_SHA,
-            repo_map: repoContext
+            provided_files: contentBundle
           };
 
-          const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
-          const completion = await client.messages.create({
+          const planResp = await claude.messages.create({
             model: CLAUDE_MODEL,
             max_tokens: 3000,
             temperature: 0.2,
-            system,
+            system: systemPlan,
             messages: [
-              {
-                role: 'user',
-                content: [
-                  { type: 'text', text: `Issue + context:\n${JSON.stringify(user, null, 2)}` }
-                ]
-              }
+              { role: 'user', content: [{ type: 'text', text: JSON.stringify(planUser) }] }
             ]
           });
 
-          const text = completion?.content?.[0]?.text?.trim() || '';
+          const pText = planResp?.content?.[0]?.text?.trim() || '';
           let plan;
           try {
-            plan = JSON.parse(text);
+            plan = JSON.parse(pText);
           } catch (e) {
-            console.error('Claude returned invalid JSON:', text);
+            console.error('Plan JSON parse error:', pText.slice(0, 800));
             process.exit(1);
           }
 
+          if (!Array.isArray(plan?.changes)) {
+            console.error('Plan missing changes[]');
+            process.exit(1);
+          }
+
+          // -------- Create branch, apply changes, push, PR --------
+          const base = planUser.branch_base;
           const branchNameSafe = (plan.title || 'ai-change')
-            .toLowerCase()
-            .replace(/[^a-z0-9]+/g, '-')
-            .replace(/(^-|-$)/g, '');
+            .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
           const branchName = `ai/${branchNameSafe}-${Date.now()}`;
 
-          const baseRef = await (async () => {
-            try {
-              return await octokit.git.getRef({ owner, repo, ref: `heads/${user.branch_base}` });
-            } catch {
-              return await octokit.git.getRef({ owner, repo, ref: 'heads/main' });
-            }
-          })();
+          let baseRef;
+          try {
+            baseRef = await octokit.git.getRef({ owner, repo, ref: `heads/${base}` });
+          } catch {
+            baseRef = await octokit.git.getRef({ owner, repo, ref: 'heads/main' });
+          }
 
           await octokit.git.createRef({
             owner, repo,
@@ -191,7 +273,7 @@ jobs:
               if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true });
               continue;
             }
-            if (['create', 'update'].includes(ch.action)) {
+            if (ch.action === 'create' || ch.action === 'update') {
               if (typeof ch.content !== 'string') {
                 console.error('Missing content for', ch.path);
                 process.exit(1);
@@ -218,16 +300,20 @@ jobs:
           const pr = await octokit.pulls.create({
             owner, repo,
             head: branchName,
-            base: user.branch_base,
+            base: base,
             title: plan.title || 'AI implementation',
             body: plan.summary || ''
           });
 
-          await octokit.issues.createComment({
-            owner, repo,
-            issue_number: issue.number,
-            body: `I created PR #${pr.data.number}: ${plan.title || ''}\n\n${plan.summary || ''}`
-          });
+          if (issue.number) {
+            await octokit.issues.createComment({
+              owner, repo,
+              issue_number: issue.number,
+              body: `I created PR #${pr.data.number}: ${plan.title || ''}\n\n${plan.summary || ''}`
+            });
+          } else {
+            console.log(`Opened PR #${pr.data.number}: ${plan.title || ''}`);
+          }
           EOF
 
       - name: Run AI implement
@@ -235,4 +321,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_MODEL: claude-3-7-sonnet-20250219
+          MAX_PATHS: "200"
+          MAX_CONTEXT_FILES: "12"
+          MAX_FILE_BYTES: "4000"
+          MAX_TOTAL_BYTES: "60000"
+          ISSUE_BODY_MAX: "4000"
         run: node scripts/ai_implement.mjs
