@@ -209,11 +209,11 @@ jobs:
           execSync('git config user.email "41898282+github-actions[bot]@users.noreply.github.com"');
           execSync('git add -A');
           try {
-            execSync(\`git commit -m "\${plan.title || 'AI implementation'}"\`);
+            execSync(`git commit -m "${plan.title || 'AI implementation'}"`);
           } catch {
             console.log('No changes to commit.');
           }
-          execSync(\`git push origin \${branchName}\`);
+          execSync(`git push origin ${branchName}`);
 
           const pr = await octokit.pulls.create({
             owner, repo,
@@ -226,7 +226,7 @@ jobs:
           await octokit.issues.createComment({
             owner, repo,
             issue_number: issue.number,
-            body: \`I created PR #\${pr.data.number}: \${plan.title || ''}\n\n\${plan.summary || ''}\`
+            body: `I created PR #${pr.data.number}: ${plan.title || ''}\n\n${plan.summary || ''}`
           });
           EOF
 
